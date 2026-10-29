@@ -309,6 +309,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         stop threshold, the device would be dropped again right away and the manager would
         toggle between both states. With two devices the shares are half the setpoint, so the
         stop threshold must stay below half the start threshold (here with 5 % margin).
+        This assumes devices of similar size; with mixed sizes (e.g. SF 2400 + SF 800) the
+        manager can still toggle, as it already does with the previous hard-coded values.
         The defaults (start 50 %, stop 15 %) are not affected.
         """
         return max(0.0, min(self.distribution_stop_pct, self.distribution_start_pct / 2 - 5))

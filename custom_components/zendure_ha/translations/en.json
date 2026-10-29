@@ -112,6 +112,15 @@
       },
       "soc_set": {
         "name": "Target SoC"
+      },
+      "distribution_start": {
+        "name": "Distribution: start next device at"
+      },
+      "distribution_stop": {
+        "name": "Distribution: stop device below"
+      },
+      "distribution_soc_diff": {
+        "name": "Distribution: SoC balance difference"
       }
     },
     "sensor": {

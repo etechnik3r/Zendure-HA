@@ -55,6 +55,17 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
     fuseGroups: list[FuseGroup] = []
     simulation: bool = False
 
+    # Power distribution thresholds (percent). The defaults reproduce the
+    # previous hard-coded behaviour exactly:
+    #   start: another device starts when the setpoint exceeds this share of the
+    #          active devices' limits (was 2 x optimal = 2 x limit/4 = 50 %)
+    #   stop:  the first device is dropped when its share stays below this share
+    #          of its own limit (was 1.5 x start = 1.5 x limit/10 = 15 %)
+    #   soc:   an idle device starts when its SoC differs by more than this (was 3 %)
+    distribution_start_pct: float = 50
+    distribution_stop_pct: float = 15
+    distribution_soc_diff: float = 3
+
     def __init__(self, hass: HomeAssistant, entry: ZendureConfigEntry) -> None:
         """Initialize Zendure Manager."""
         super().__init__(hass, _LOGGER, name="Zendure Manager", update_interval=SCAN_INTERVAL, config_entry=entry)
@@ -107,6 +118,11 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         )
         self.operationstate = ZendureSensor(self, "operation_state")
         self.manualpower = ZendureRestoreNumber(self, "manual_power", None, None, "W", "power", 12000, -12000, NumberMode.BOX, True)
+        self.startThreshold = ZendureRestoreNumber(self, "distribution_start", self.update_distribution, None, "%", None, 100, 10, NumberMode.BOX, True)
+        self.stopThreshold = ZendureRestoreNumber(self, "distribution_stop", self.update_distribution, None, "%", None, 50, 0, NumberMode.BOX, True)
+        self.socThreshold = ZendureRestoreNumber(self, "distribution_soc_diff", self.update_distribution, None, "%", None, 50, 1, NumberMode.BOX, True)
+        for entity, value in ((self.startThreshold, self.distribution_start_pct), (self.stopThreshold, self.distribution_stop_pct), (self.socThreshold, self.distribution_soc_diff)):
+            entity.update_value(value)
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy_storage", None, 1)
         self.totalKwh = ZendureSensor(self, "total_kwh", None, "kWh", "energy_storage", "measurement", 2)
         self.power = ZendureSensor(self, "power", None, "W", "power", "measurement", 0)
@@ -255,6 +271,31 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 for d in fg.devices:
                     d.fuseGrp = fg
                 self.fuseGroups.append(fg)
+
+    def update_distribution(self, entity: ZendureRestoreNumber, value: Any) -> None:
+        """Update a power distribution threshold (written by the user or restored)."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return
+        match entity.translation_key:
+            case "distribution_start":
+                self.distribution_start_pct = min(max(value, 10), 100)
+            case "distribution_stop":
+                self.distribution_stop_pct = min(max(value, 0), 50)
+            case "distribution_soc_diff":
+                self.distribution_soc_diff = min(max(value, 1), 50)
+        _LOGGER.info(
+            "Distribution thresholds: start %s%%, stop %s%%, soc diff %s%%", self.distribution_start_pct, self.distribution_stop_pct, self.distribution_soc_diff
+        )
+
+    def start_power(self, optimal: int) -> float:
+        """Return the power above which another device is started (optimal = limit // 4)."""
+        return optimal * self.distribution_start_pct / 25
+
+    def stop_power(self, start: int) -> float:
+        """Return the power below which the first device counts as underused (start = limit // 10)."""
+        return start * self.distribution_stop_pct / 10
 
     async def update_operation(self, entity: ZendureSelect, _operation: Any) -> None:
         operation = ManagerMode(entity.value)
@@ -540,7 +581,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.operationstate.update_value(ManagerState.CHARGE.value if setpoint < 0 else ManagerState.IDLE.value)
 
         # distribute charging devices
-        dev_start = min(0, setpoint - self.charge_optimal * 2) if setpoint < -SmartMode.POWER_START else 0
+        dev_start = min(0, setpoint - self.start_power(self.charge_optimal)) if setpoint < -SmartMode.POWER_START else 0
         limit = self.charge_limit
         setpoint = max(limit, setpoint)
         for i, d in enumerate(sorted(self.charge, key=lambda d: d.electricLevel.asInt, reverse=True)):
@@ -567,11 +608,11 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             # pwr_low accumulates a positive deficit, while charge_optimal is negative,
             # so compare against its magnitude (mirrors the discharge side).
             if len(self.charge) > 1 and i == 0:
-                self.pwr_low = 0 if (delta := d.charge_start * 1.5 - pwr) >= 0 else self.pwr_low + int(-delta)
+                self.pwr_low = 0 if (delta := self.stop_power(d.charge_start) - pwr) >= 0 else self.pwr_low + int(-delta)
                 pwr = 0 if self.pwr_low > -d.charge_optimal else pwr
 
             setpoint -= await d.power_charge(pwr)
-            dev_start += -1 if pwr != 0 and d.electricLevel.asInt > self.idle_lvlmin + 3 else 0
+            dev_start += -1 if pwr != 0 and d.electricLevel.asInt > self.idle_lvlmin + self.distribution_soc_diff else 0
 
         # start idle device if needed
         if dev_start < 0 and len(self.idle) > 0:
@@ -582,7 +623,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 # if a offGrid device need to be started, the output power is set to 0 and it take all offGrid power from grid
                 start_pwr = SmartMode.POWER_START
                 await d.power_charge(-start_pwr - max(0, d.pwr_offgrid) if d.state != DeviceState.SOCFULL else -max(0, d.pwr_offgrid))
-                if (dev_start := dev_start - d.charge_optimal * 2) >= 0:
+                if (dev_start := dev_start - self.start_power(d.charge_optimal)) >= 0:
                     break
             self.pwr_low: int = 0
 
@@ -602,7 +643,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             await d.power_discharge(0 if max(0, d.pwr_offgrid) == 0 else 10)
 
         # distribute discharging devices, use produced power first, before adding another device
-        dev_start = max(0, setpoint - self.discharge_optimal * 2 - self.discharge_produced) if setpoint > SmartMode.POWER_START else 0
+        dev_start = max(0, setpoint - self.start_power(self.discharge_optimal) - self.discharge_produced) if setpoint > SmartMode.POWER_START else 0
         solaronly = self.discharge_produced >= setpoint
         limit = self.discharge_produced if solaronly else self.discharge_limit
         setpoint = min(limit, setpoint)
@@ -633,11 +674,11 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
             # make sure we have devices in optimal working range
             if len(self.discharge) > 1 and i == 0 and d.state != DeviceState.SOCFULL:
-                self.pwr_low = 0 if (delta := d.discharge_start * 1.5 - pwr) <= 0 else self.pwr_low + int(delta)
+                self.pwr_low = 0 if (delta := self.stop_power(d.discharge_start) - pwr) <= 0 else self.pwr_low + int(delta)
                 pwr = 0 if self.pwr_low > d.discharge_optimal else pwr
 
             setpoint -= await d.power_discharge(pwr)
-            dev_start += 1 if pwr != 0 and d.electricLevel.asInt + 3 < self.idle_lvlmax else 0
+            dev_start += 1 if pwr != 0 and d.electricLevel.asInt + self.distribution_soc_diff < self.idle_lvlmax else 0
 
         # start idle device if needed
         if dev_start > 0 and len(self.idle) > 0:
@@ -645,6 +686,6 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             for d in self.idle:
                 if d.state != DeviceState.SOCEMPTY:
                     await d.power_discharge(SmartMode.POWER_START)
-                    if (dev_start := dev_start - d.discharge_optimal * 2) <= 0:
+                    if (dev_start := dev_start - self.start_power(d.discharge_optimal)) <= 0:
                         break
             self.pwr_low: int = 0

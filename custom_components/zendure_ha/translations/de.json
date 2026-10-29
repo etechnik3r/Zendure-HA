@@ -101,6 +101,15 @@
       },
       "soc_set": {
         "name": "SoC-Zielwert"
+      },
+      "distribution_start": {
+        "name": "Verteilung: weiteres Gerät ab"
+      },
+      "distribution_stop": {
+        "name": "Verteilung: Gerät abschalten unter"
+      },
+      "distribution_soc_diff": {
+        "name": "Verteilung: SoC-Ausgleich ab Differenz"
       }
     },
     "sensor": {

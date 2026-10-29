@@ -151,6 +151,7 @@ async def test_charge_soc_balance(soc_diff: float, expect_start: bool) -> None:
 async def test_discharge_stop_threshold(stop_pct: float, expect_drop: bool) -> None:
     """Two devices share 800 W (about 400 W each, i.e. ~17 % of 2400 W)."""
     manager = _make_manager_harness()
+    manager.distribution_start_pct = 80  # keeps the hysteresis guard (start / 2 - 5) out of the way
     manager.distribution_stop_pct = stop_pct
     low, high = _device(50), _device(50)
 
@@ -165,6 +166,7 @@ async def test_discharge_stop_threshold(stop_pct: float, expect_drop: bool) -> N
 async def test_charge_stop_threshold(stop_pct: float, expect_drop: bool) -> None:
     """Two devices share -1200 W (about -600 W each, i.e. ~19 % of 3200 W)."""
     manager, now = _charging_harness()
+    manager.distribution_start_pct = 80  # keeps the hysteresis guard (start / 2 - 5) out of the way
     manager.distribution_stop_pct = stop_pct
     high, low = _charge_device(50), _charge_device(50)
 
@@ -248,3 +250,98 @@ async def test_idle_socempty_device_is_not_started() -> None:
     await manager.power_discharge(2000)
 
     assert empty.discharge_calls == []
+
+
+# ── number entities: user write and restore after restart (real HA objects) ──
+
+
+def _threshold_number(device, manager: ZendureManager, key: str, maximum: int, minimum: int):  # noqa: ANN001, ANN202
+    from homeassistant.components.number import NumberMode
+
+    from custom_components.zendure_ha.number import ZendureRestoreNumber
+
+    return ZendureRestoreNumber(device, key, manager.update_distribution, None, "%", None, maximum, minimum, NumberMode.BOX, True)
+
+
+async def test_threshold_written_by_user_reaches_manager(zensdk_device) -> None:  # noqa: ANN001
+    manager = _make_manager_harness()
+    number = _threshold_number(zensdk_device, manager, "distribution_start", 100, 10)
+
+    await number.async_set_native_value(80)
+
+    assert manager.distribution_start_pct == 80
+    assert number.native_value == 80
+
+    await number.async_set_native_value(150)  # above the entity range -> clamped to 100
+
+    assert manager.distribution_start_pct == 100
+
+
+async def test_threshold_is_restored_after_restart(hass, zensdk_device) -> None:  # noqa: ANN001
+    from homeassistant.core import State
+    from pytest_homeassistant_custom_component.common import mock_restore_cache
+
+    manager = _make_manager_harness()
+    number = _threshold_number(zensdk_device, manager, "distribution_soc_diff", 50, 1)
+    number.hass = hass
+    number.entity_id = "number.solarflow_2400_ac_distribution_soc_diff"
+    mock_restore_cache(hass, [State(number.entity_id, "12")])
+
+    await number.async_added_to_hass()
+
+    assert manager.distribution_soc_diff == 12
+    assert number.native_value == 12
+
+
+async def test_threshold_without_stored_state_keeps_default(hass, zensdk_device) -> None:  # noqa: ANN001
+    from pytest_homeassistant_custom_component.common import mock_restore_cache
+
+    manager = _make_manager_harness()
+    number = _threshold_number(zensdk_device, manager, "distribution_stop", 50, 0)
+    number.update_value(manager.distribution_stop_pct)  # as done in ZendureManager.loadDevices
+    number.hass = hass
+    number.entity_id = "number.solarflow_2400_ac_distribution_stop"
+    mock_restore_cache(hass, [])
+
+    await number.async_added_to_hass()
+
+    assert manager.distribution_stop_pct == 15
+    assert number.native_value == 15
+
+
+# ── hysteresis guard between start and stop threshold ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("start_pct", "stop_pct", "effective"),
+    [(50, 15, 15), (50, 25, 20), (20, 30, 5), (10, 50, 0), (100, 50, 45)],
+)
+def test_effective_stop_keeps_hysteresis_band(start_pct: float, stop_pct: float, effective: float) -> None:
+    manager = _make_manager_harness()
+    manager.distribution_start_pct = start_pct
+    manager.distribution_stop_pct = stop_pct
+    assert manager.effective_stop_pct() == effective
+
+
+async def test_no_toggling_with_close_thresholds() -> None:
+    """start 20 % / stop 30 % would toggle; the guard keeps the second device running.
+
+    One device carries 900 W -> above 20 % of 2400 W, so the idle device is started.
+    Afterwards both share ~450 W (~19 %), which is below the configured 30 % but above
+    the effective stop threshold (5 %), so neither device is dropped again.
+    """
+    manager = _make_manager_harness()
+    manager.distribution_start_pct = 20
+    manager.distribution_stop_pct = 30
+    a, b = _device(50), _device(50)
+
+    _prime_discharge(manager, [a], [b])
+    await manager.power_discharge(900)
+    assert b.discharge_calls == [50]
+
+    for _ in range(20):
+        _prime_discharge(manager, [a, b])
+        await manager.power_discharge(900)
+
+    assert a.discharge_calls[-1] > 0
+    assert b.discharge_calls[-1] > 0

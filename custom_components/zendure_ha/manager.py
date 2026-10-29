@@ -121,8 +121,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.startThreshold = ZendureRestoreNumber(self, "distribution_start", self.update_distribution, None, "%", None, 100, 10, NumberMode.BOX, True)
         self.stopThreshold = ZendureRestoreNumber(self, "distribution_stop", self.update_distribution, None, "%", None, 50, 0, NumberMode.BOX, True)
         self.socThreshold = ZendureRestoreNumber(self, "distribution_soc_diff", self.update_distribution, None, "%", None, 50, 1, NumberMode.BOX, True)
-        for entity, value in ((self.startThreshold, self.distribution_start_pct), (self.stopThreshold, self.distribution_stop_pct), (self.socThreshold, self.distribution_soc_diff)):
-            entity.update_value(value)
+        self.startThreshold.update_value(self.distribution_start_pct)
+        self.stopThreshold.update_value(self.distribution_stop_pct)
+        self.socThreshold.update_value(self.distribution_soc_diff)
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy_storage", None, 1)
         self.totalKwh = ZendureSensor(self, "total_kwh", None, "kWh", "energy_storage", "measurement", 2)
         self.power = ZendureSensor(self, "power", None, "W", "power", "measurement", 0)
@@ -286,7 +287,11 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             case "distribution_soc_diff":
                 self.distribution_soc_diff = min(max(value, 1), 50)
         _LOGGER.info(
-            "Distribution thresholds: start %s%%, stop %s%%, soc diff %s%%", self.distribution_start_pct, self.distribution_stop_pct, self.distribution_soc_diff
+            "Distribution thresholds: start %s%%, stop %s%% (effective %s%%), soc diff %s%%",
+            self.distribution_start_pct,
+            self.distribution_stop_pct,
+            self.effective_stop_pct(),
+            self.distribution_soc_diff,
         )
 
     def start_power(self, optimal: int) -> float:
@@ -295,7 +300,18 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
     def stop_power(self, start: int) -> float:
         """Return the power below which the first device counts as underused (start = limit // 10)."""
-        return start * self.distribution_stop_pct / 10
+        return start * self.effective_stop_pct() / 10
+
+    def effective_stop_pct(self) -> float:
+        """Return the stop threshold, limited to keep a hysteresis band to the start threshold.
+
+        After another device is started, the load is shared. If the shares were below the
+        stop threshold, the device would be dropped again right away and the manager would
+        toggle between both states. With two devices the shares are half the setpoint, so the
+        stop threshold must stay below half the start threshold (here with 5 % margin).
+        The defaults (start 50 %, stop 15 %) are not affected.
+        """
+        return max(0.0, min(self.distribution_stop_pct, self.distribution_start_pct / 2 - 5))
 
     async def update_operation(self, entity: ZendureSelect, _operation: Any) -> None:
         operation = ManagerMode(entity.value)

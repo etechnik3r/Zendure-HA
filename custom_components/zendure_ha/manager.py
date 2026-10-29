@@ -564,9 +564,11 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 pwr = max(setpoint - limit, setpoint, d.pwr_max)
 
             # make sure we have devices in optimal working range
+            # pwr_low accumulates a positive deficit, while charge_optimal is negative,
+            # so compare against its magnitude (mirrors the discharge side).
             if len(self.charge) > 1 and i == 0:
                 self.pwr_low = 0 if (delta := d.charge_start * 1.5 - pwr) >= 0 else self.pwr_low + int(-delta)
-                pwr = 0 if self.pwr_low < d.charge_optimal else pwr
+                pwr = 0 if self.pwr_low > -d.charge_optimal else pwr
 
             setpoint -= await d.power_charge(pwr)
             dev_start += -1 if pwr != 0 and d.electricLevel.asInt > self.idle_lvlmin + 3 else 0

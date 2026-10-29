@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from .test_manager_dispatch import _FakeDevice, _make_manager_harness
+from test_manager_dispatch import _FakeDevice, _make_manager_harness
+
+from custom_components.zendure_ha.manager import ZendureManager
 
 
 def _charge_device(level: int) -> _FakeDevice:
@@ -33,14 +35,16 @@ def _discharge_device(level: int) -> _FakeDevice:
     return d
 
 
-def _prime_charge(manager, devices) -> None:
+def _prime_charge(manager: ZendureManager, devices: list[_FakeDevice]) -> None:
     manager.charge = list(devices)
     manager.charge_limit = sum(d.pwr_max for d in devices)
     manager.charge_optimal = sum(d.charge_optimal for d in devices)
-    manager.charge_weight = sum(d.pwr_max * (100 - d.electricLevel.asInt) for d in devices)
+    manager.charge_weight = sum(
+        d.pwr_max * (100 - d.electricLevel.asInt) for d in devices
+    )
 
 
-def _prime_discharge(manager, devices) -> None:
+def _prime_discharge(manager: ZendureManager, devices: list[_FakeDevice]) -> None:
     manager.discharge = list(devices)
     manager.discharge_limit = sum(d.pwr_max for d in devices)
     manager.discharge_optimal = sum(d.discharge_optimal for d in devices)
@@ -48,9 +52,12 @@ def _prime_discharge(manager, devices) -> None:
 
 
 async def test_power_discharge_drops_device_with_small_share() -> None:
-    """Reference behaviour: two devices sharing 600 W -> the lower-SoC device
-    (first in the ascending sort) gets ~300 W < 1.5 x 240 W and is dropped once
-    the accumulated deficit exceeds discharge_optimal (600 W)."""
+    """Drop the lower-SoC device when its discharge share stays too small.
+
+    Reference behaviour: two devices sharing 600 W. The lower-SoC device
+    (first in the ascending sort) gets 240 W < 1.5 x 240 W and is dropped once
+    the accumulated deficit exceeds discharge_optimal (600 W).
+    """
     manager = _make_manager_harness()
     low, high = _discharge_device(40), _discharge_device(60)
 
@@ -63,11 +70,14 @@ async def test_power_discharge_drops_device_with_small_share() -> None:
 
 
 async def test_power_charge_drops_device_with_small_share() -> None:
-    """Mirror of the discharge case: two devices charging with -600 W surplus.
-    The higher-SoC device (first in the descending sort) gets ~-150 W, well
+    """Drop the higher-SoC device when its charge share stays too small.
+
+    Mirror of the discharge case: two devices charging with -600 W surplus.
+    The higher-SoC device (first in the descending sort) gets -150 W, well
     below 1.5 x charge_start (-480 W). Once the accumulated deficit exceeds
     |charge_optimal| (800 W) it must be dropped (set to 0), like on the
-    discharge side."""
+    discharge side.
+    """
     manager = _make_manager_harness()
     now = datetime(2026, 10, 29, 12, 0, 0)
     manager.charge_time = now - timedelta(seconds=1)  # hysteresis already passed
@@ -82,8 +92,11 @@ async def test_power_charge_drops_device_with_small_share() -> None:
 
 
 async def test_power_charge_keeps_device_with_large_share() -> None:
-    """Regression guard: when both shares are well above the threshold, the
-    deficit counter stays at 0 and no device is dropped."""
+    """Keep both devices when their charge shares are large enough.
+
+    Regression guard: with both shares well above the threshold the deficit
+    counter stays at 0 and no device is dropped.
+    """
     manager = _make_manager_harness()
     now = datetime(2026, 10, 29, 12, 0, 0)
     manager.charge_time = now - timedelta(seconds=1)
